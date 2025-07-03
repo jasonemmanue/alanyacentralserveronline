@@ -137,12 +137,14 @@ wss.on('connection', (ws) => {
                 }
                 break;
 
-            case 'GET_PEER_INFO':
+           case 'GET_PEER_INFO':
                 const targetUsername = command.data.targetUsername;
                 const requesterInfo = authenticatedUser;
                 const targetInfo = connectedClients.get(targetUsername);
 
-                if (targetInfo && targetInfo.p2pHost && targetInfo.p2pPort) {
+                // **CORRECTION :** On s'assure que les deux clients ont bien des informations P2P valides avant de continuer.
+                if (targetInfo && targetInfo.p2pHost && targetInfo.p2pPort && requesterInfo.p2pHost && requesterInfo.p2pPort) {
+                    
                     console.log(`[Hole Punching] Étape 1: Envoi des infos de ${targetUsername} à ${requesterInfo.username}`);
                     sendResponse(requesterInfo.ws, 'P2P_PEER_INFO', { 
                         username: targetUsername, 
@@ -158,10 +160,10 @@ wss.on('connection', (ws) => {
                     }, true, "Demande de connexion P2P entrante.");
 
                 } else {
+                    // Si l'un des deux n'est pas prêt, on répond "non joignable". Le client réessaiera.
                     sendResponse(ws, 'P2P_PEER_INFO', { username: targetUsername }, false, "Peer non joignable");
                 }
                 break;
-
             case 'INITIATE_AUDIO_CALL':
             case 'INITIATE_VIDEO_CALL':
                 const targetCallUsername = command.data.targetUsername;
