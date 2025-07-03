@@ -1,7 +1,6 @@
 /**
- * Alanya - Serveur Central en Node.js (Version finale)
- * Ce serveur reçoit les informations de connexion (y compris l'IP et le port publics découverts par STUN)
- * et agit comme un annuaire pour la mise en relation P2P.
+ * Alanya - Serveur Central en Node.js (Version finale et complète)
+ * Gère l'authentification, la présence et le signaling pour les connexions P2P et les appels.
  */
 
 // --- Imports des librairies nécessaires ---
@@ -26,9 +25,10 @@ const dbConfig = {
     queueLimit: 0
 };
 const pool = mysql.createPool(dbConfig);
-console.log("Pool de connexions configuré pour la base de données en ligne.");
+console.log("Pool de connexions configuré.");
 
 // Map pour garder en mémoire les clients connectés
+// Clé: username, Valeur: { ws: WebSocket, id: userId, p2pHost: '...', p2pPort: '...' }
 const connectedClients = new Map();
 
 
@@ -45,7 +45,7 @@ function hashMotDePasse(password) {
  * Envoie une réponse structurée à un client via WebSocket.
  */
 function sendResponse(ws, type, data, success, message) {
-    if (ws.readyState === ws.OPEN) {
+    if (ws && ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({
             type: type,
             success: success,
@@ -54,6 +54,7 @@ function sendResponse(ws, type, data, success, message) {
         }));
     }
 }
+
 
 // --- Initialisation du Serveur Express et WebSocket ---
 const app = express();
@@ -66,7 +67,6 @@ console.log(`Serveur Node.js démarré. WebSocket écoutera sur le port ${PORT}`
 // --- Logique Principale du Serveur WebSocket ---
 wss.on('connection', (ws) => {
     console.log('Nouveau client WebSocket connecté.');
-    
     let authenticatedUser = null;
 
     // Gestion des messages reçus du client
@@ -74,12 +74,12 @@ wss.on('connection', (ws) => {
         let command;
         try {
             command = JSON.parse(message);
-            console.log(`Commande reçue de ${authenticatedUser?.username || 'client non authentifié'}:`, command.type);
         } catch (error) {
             console.error('Erreur: Message reçu non-JSON:', message.toString());
             return;
         }
 
+        // Si le client n'est pas authentifié, seule la commande AUTHENTICATE est autorisée
         if (!authenticatedUser && command.type !== 'AUTHENTICATE') {
             sendResponse(ws, 'AUTHENTICATION_FAILED', null, false, "Authentification requise.");
             return;
@@ -94,65 +94,69 @@ wss.on('connection', (ws) => {
                     const hashedPassword = hashMotDePasse(password);
 
                     const [rows] = await pool.execute(
-                        "SELECT id, nom_utilisateur, mot_de_passe, statut FROM Utilisateurs WHERE nom_utilisateur = ? OR email = ? OR telephone = ?",
+                        "SELECT id, nom_utilisateur, mot_de_passe FROM Utilisateurs WHERE nom_utilisateur = ? OR email = ? OR telephone = ?",
                         [identifier, identifier, identifier]
                     );
 
                     if (rows.length === 0 || rows[0].mot_de_passe !== hashedPassword) {
-                        sendResponse(ws, 'AUTHENTICATION_FAILED', null, false, "Identifiant ou mot de passe incorrect.");
+                        sendResponse(ws, 'AUTHENTICATION_FAILED', null, false, "Identifiants incorrects.");
                         return;
                     }
 
                     const user = rows[0];
-
                     if (connectedClients.has(user.nom_utilisateur)) {
                         sendResponse(ws, 'USER_ALREADY_CONNECTED', null, false, "Ce compte est déjà connecté.");
                         ws.close();
                         return;
                     }
 
-                    authenticatedUser = {
-                        id: user.id,
-                        username: user.nom_utilisateur,
-                        ws: ws,
-                        p2pHost: null,
-                        p2pPort: null
-                    };
+                    authenticatedUser = { id: user.id, username: user.nom_utilisateur, ws: ws, p2pHost: null, p2pPort: null };
                     connectedClients.set(user.nom_utilisateur, authenticatedUser);
                     
                     await pool.execute("UPDATE Utilisateurs SET statut = 'actif', derniere_connexion_timestamp = CURRENT_TIMESTAMP WHERE id = ?", [user.id]);
 
-                    console.log(`Utilisateur ${user.nom_utilisateur} (ID: ${user.id}) authentifié avec succès.`);
-                    sendResponse(ws, 'AUTHENTICATION_SUCCESS', { id: user.id, username: user.nom_utilisateur }, true, "Authentification réussie. Bienvenue !");
+                    console.log(`Utilisateur ${user.nom_utilisateur} (ID: ${user.id}) authentifié.`);
+                    sendResponse(ws, 'AUTHENTICATION_SUCCESS', { id: user.id, username: user.nom_utilisateur }, true, "Authentification réussie.");
 
                 } catch (dbError) {
                     console.error("Erreur de BDD lors de l'authentification:", dbError);
-                    sendResponse(ws, 'AUTHENTICATION_FAILED', null, false, "Erreur serveur lors de l'authentification.");
+                    sendResponse(ws, 'AUTHENTICATION_FAILED', null, false, "Erreur serveur.");
                 }
                 break;
 
             case 'CLIENT_SERVER_STARTED':
-                // ✅ **MODIFICATION CLÉ** : Le serveur reçoit et fait confiance à l'IP et au Port
-                // que le client a découverts via STUN.
                 const { host, port } = command.data;
                 if (authenticatedUser) {
                     authenticatedUser.p2pHost = host;
                     authenticatedUser.p2pPort = port;
                     
-                    // On met à jour la base de données avec l'IP publique et le port public
                     await pool.execute("UPDATE Utilisateurs SET last_known_ip = ?, last_known_port = ? WHERE id = ?", [host, port, authenticatedUser.id]);
                     
                     console.log(`Infos P2P (IP/Port Publics) pour ${authenticatedUser.username} mises à jour: ${host}:${port}`);
-                    sendResponse(ws, 'P2P_SERVER_REGISTERED', null, true, "Connecté et visible par les autres utilisateurs.");
+                    sendResponse(ws, 'P2P_SERVER_REGISTERED', null, true, "Connecté et visible.");
                 }
                 break;
 
             case 'GET_PEER_INFO':
-                const { targetUsername } = command.data;
-                const peerInfo = connectedClients.get(targetUsername);
-                if (peerInfo && peerInfo.p2pPort) {
-                    // On renvoie l'IP et le port publics que le serveur a stockés
-                    sendResponse(ws, 'P2P_PEER_INFO', { username: targetUsername, host: peerInfo.p2pHost, port: peerInfo.p2pPort }, true, "Peer en ligne.");
+                const targetUsername = command.data.targetUsername;
+                const requesterInfo = authenticatedUser;
+                const targetInfo = connectedClients.get(targetUsername);
+
+                if (targetInfo && targetInfo.p2pHost && targetInfo.p2pPort) {
+                    console.log(`[Hole Punching] Étape 1: Envoi des infos de ${targetUsername} à ${requesterInfo.username}`);
+                    sendResponse(requesterInfo.ws, 'P2P_PEER_INFO', { 
+                        username: targetUsername, 
+                        host: targetInfo.p2pHost, 
+                        port: targetInfo.p2pPort 
+                    }, true, "Peer en ligne.");
+
+                    console.log(`[Hole Punching] Étape 2: Envoi d'une demande de connexion de ${requesterInfo.username} à ${targetUsername}`);
+                    sendResponse(targetInfo.ws, 'P2P_CONNECT_REQUEST', {
+                        username: requesterInfo.username,
+                        host: requesterInfo.p2pHost,
+                        port: requesterInfo.p2pPort
+                    }, true, "Demande de connexion P2P entrante.");
+
                 } else {
                     sendResponse(ws, 'P2P_PEER_INFO', { username: targetUsername }, false, "Peer non joignable");
                 }
@@ -170,7 +174,7 @@ wss.on('connection', (ws) => {
                         type: command.type === 'INITIATE_VIDEO_CALL' ? 'video' : 'audio'
                     }, true, "Appel entrant");
                 } else {
-                    sendResponse(ws, 'CALL_REJECTED_BY_PEER', { responderUsername: targetCallUsername }, false, "L'utilisateur n'est pas connecté.");
+                    sendResponse(ws, 'CALL_REJECTED_BY_PEER', { responderUsername: targetCallUsername, type: command.type.includes('VIDEO') ? 'video' : 'audio' }, false, "L'utilisateur n'est pas connecté.");
                 }
                 break;
 
@@ -180,9 +184,9 @@ wss.on('connection', (ws) => {
                 if (initiatorClient) {
                     console.log(`Relai de la réponse à l'appel de ${authenticatedUser.username} vers ${initiatorUsername}`);
                     
-                    // La réponse inclut déjà l'IP et le(s) port(s) publics du répondeur
-                    const responseData = command.data;
+                    const responseData = { ...command.data, ip: authenticatedUser.p2pHost }; 
                     const responseType = command.data.accepted === 'true' ? 'CALL_ACCEPTED_BY_PEER' : 'CALL_REJECTED_BY_PEER';
+                    
                     sendResponse(initiatorClient.ws, responseType, responseData, true, "Réponse à l'appel.");
                 }
                 break;
@@ -203,6 +207,11 @@ wss.on('connection', (ws) => {
             case 'DISCONNECT':
                 ws.close();
                 break;
+                
+            default:
+                 console.log(`Commande non gérée reçue: ${command.type}`);
+                 sendResponse(ws, 'GENERIC_ERROR', null, false, `Commande inconnue: ${command.type}`);
+                 break;
         }
     });
 
@@ -212,22 +221,19 @@ wss.on('connection', (ws) => {
             console.log(`Client ${authenticatedUser.username} déconnecté.`);
             connectedClients.delete(authenticatedUser.username);
             try {
-                // Met à jour le statut en BDD
                 await pool.execute(
-                    "UPDATE Utilisateurs SET statut = 'hors-ligne', derniere_deconnexion_timestamp = CURRENT_TIMESTAMP WHERE id = ?", 
+                    "UPDATE Utilisateurs SET statut = 'hors-ligne', derniere_deconnexion_timestamp = CURRENT_TIMESTAMP WHERE id = ?",
                     [authenticatedUser.id]
                 );
             } catch (dbError) {
                 console.error(`Erreur BDD lors de la déconnexion de ${authenticatedUser.username}:`, dbError);
             }
         } else {
-            console.log('Client non authentifié déconnecté.');
+             console.log('Client non authentifié déconnecté.');
         }
     });
 
-    ws.on('error', (error) => {
-        console.error('Erreur WebSocket:', error);
-    });
+    ws.on('error', (error) => console.error('Erreur WebSocket:', error));
 });
 
 // Lancement final du serveur HTTP (qui héberge le serveur WebSocket)
